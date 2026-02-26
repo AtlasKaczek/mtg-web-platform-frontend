@@ -1,6 +1,16 @@
-import { createSignal, createResource, For, Show } from 'solid-js';
+import { createSignal, createResource, onMount, For, Show } from 'solid-js';
+import { UserManager, User } from 'oidc-client-ts';
 
-// Match the Go struct
+// Configure the connection to Keycloak
+const userManager = new UserManager({
+  authority: 'http://localhost:8081/realms/mtg-realm',
+  client_id: 'mtg-frontend',
+  redirect_uri: 'http://localhost:3000',
+  post_logout_redirect_uri: 'http://localhost:3000',
+  response_type: 'code',
+  scope: 'openid profile',
+});
+
 interface GameTable {
   id: string;
   name: string;
@@ -10,29 +20,50 @@ interface GameTable {
   maxPlayers: number;
 }
 
-// Fetcher function for createResource
 const fetchTables = async () => {
-  // If using VS Code remote, keep using your forwarded localhost or remote IP
   const response = await fetch('http://localhost:8080/api/tables');
   if (!response.ok) throw new Error("Network response was not ok");
   return response.json() as Promise<GameTable[]>;
 };
 
 function App() {
-  // This signal acts as a trigger. When we update it, createResource refetches.
   const [refetchTrigger, setRefetchTrigger] = createSignal(0);
-  
-  // createResource automatically fetches when the component mounts or the trigger changes
   const [tables, { refetch }] = createResource(refetchTrigger, fetchTables);
+  
+  // State to hold our logged-in user
+  const [user, setUser] = createSignal<User | null>(null);
 
-  const handleRefresh = () => {
-    setRefetchTrigger(prev => prev + 1);
-  };
+  onMount(async () => {
+    // 1. Check if we are returning from a Keycloak login redirect
+    try {
+      if (window.location.search.includes('code=')) {
+        const loggedInUser = await userManager.signinCallback();
+        setUser(loggedInUser);
+        // Clean up the URL so the '?code=...' disappears
+        window.history.replaceState({}, document.title, window.location.pathname);
+      } else {
+        // 2. Otherwise, check if we already have a saved session
+        const currentUser = await userManager.getUser();
+        setUser(currentUser);
+      }
+    } catch (e) {
+      console.error("Auth error:", e);
+    }
+  });
+
+  const handleLogin = () => userManager.signinRedirect();
+  const handleLogout = () => userManager.signoutRedirect();
+  const handleRefresh = () => setRefetchTrigger(prev => prev + 1);
 
   const handleCreateTable = async () => {
+    if (!user()) {
+      alert("You must be logged in to create a table!");
+      return;
+    }
+
     const newTable = {
-      name: `Table ${Math.floor(Math.random() * 1000)}`, // Random name for testing
-      hostName: "Kaczeq",
+      name: `Table ${Math.floor(Math.random() * 1000)}`,
+      hostName: user()?.profile.preferred_username || "Unknown Mage",
       format: "Modern",
       maxPlayers: 2
     };
@@ -40,14 +71,15 @@ function App() {
     try {
       const response = await fetch('http://localhost:8080/api/tables', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          // We will eventually verify this token on the Go backend!
+          'Authorization': `Bearer ${user()?.access_token}` 
+        },
         body: JSON.stringify(newTable)
       });
 
-      if (response.ok) {
-        // Table created successfully, refresh the list!
-        handleRefresh();
-      }
+      if (response.ok) handleRefresh();
     } catch (error) {
       console.error("Failed to create table:", error);
     }
@@ -59,28 +91,43 @@ function App() {
         <h1 class="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-orange-400 to-red-600">
           MTG Arena Nexus
         </h1>
+        
+        {/* Authentication Controls */}
         <div class="flex items-center gap-4">
-          <Show when={tables.loading}>
-            <span class="text-gray-400 text-sm animate-pulse">Fetching...</span>
+          <Show when={user()} fallback={
+            <button onClick={handleLogin} class="bg-orange-600 hover:bg-orange-500 text-white px-6 py-2 rounded font-bold transition shadow-lg border border-orange-400">
+              Log In
+            </button>
+          }>
+            <div class="flex items-center gap-4">
+              <span class="text-gray-300 font-medium text-lg">
+                Welcome, <span class="text-white font-bold">{user()?.profile.preferred_username}</span>
+              </span>
+              <button onClick={handleLogout} class="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded text-sm transition">
+                Log Out
+              </button>
+            </div>
           </Show>
-          <button 
-            onClick={handleRefresh}
-            class="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded text-sm transition"
-          >
-            Refresh List
-          </button>
         </div>
       </header>
 
       <main>
         <div class="flex justify-between items-center mb-6">
           <h2 class="text-2xl font-bold">Open Tables</h2>
-          <button 
-            onClick={handleCreateTable}
-            class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded font-bold shadow-lg transition"
-          >
-            + Create Table
-          </button>
+          <div class="flex items-center gap-4">
+            <Show when={tables.loading}>
+              <span class="text-gray-400 text-sm animate-pulse">Fetching...</span>
+            </Show>
+            <button onClick={handleRefresh} class="text-gray-400 hover:text-white transition text-sm">
+              Refresh
+            </button>
+            <button 
+              onClick={handleCreateTable}
+              class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded font-bold shadow-lg transition"
+            >
+              + Create Table
+            </button>
+          </div>
         </div>
 
         {/* The Grid of Tables */}
